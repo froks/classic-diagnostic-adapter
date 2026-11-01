@@ -27,7 +27,7 @@ use crate::{
     DoipEcu, DoipTransportConfig, EcuTimeouts, GatewayConnectionConfig, GatewayDoipConfig,
     GatewaySetup,
     connection_receiver::spawn_gateway_receiver_task,
-    connection_sender::spawn_gateway_sender_task,
+    connection_sender::{OutgoingMessage, spawn_gateway_sender_task},
     connections::EcuError::EcuConnectionError,
     ecu_connection::{self, ECUConnectionRead, EcuConnectionTarget},
 };
@@ -50,7 +50,7 @@ pub(crate) struct ConnectControl {
 }
 
 struct GatewayConnectionHandles {
-    sender: mpsc::Sender<DoipPayload>,
+    sender: mpsc::Sender<OutgoingMessage>,
     receivers: HashMap<u16, broadcast::Receiver<Result<DiagnosticResponse, EcuError>>>,
 }
 
@@ -236,7 +236,7 @@ where
 )]
 fn create_ecu_receiver_map(
     ecus: Vec<u16>,
-    sender: &mpsc::Sender<DoipPayload>, // sender is shared between all ecus of a gateway
+    sender: &mpsc::Sender<OutgoingMessage>, // sender is shared between all ecus of a gateway
     receiver: &HashMap<u16, broadcast::Receiver<Result<DiagnosticResponse, EcuError>>>,
 ) -> HashMap<u16, Arc<Mutex<DoipEcu>>> {
     let mut doip_ecus: HashMap<u16, Arc<Mutex<DoipEcu>>> = HashMap::new();
@@ -276,7 +276,7 @@ async fn connection_handler(
     control: Option<&ConnectControl>,
 ) -> Result<GatewayConnectionHandles, EcuError> {
     // channel to send messages to the gateway / ecus
-    let (intx, inrx) = mpsc::channel::<DoipPayload>(50);
+    let (intx, inrx) = mpsc::channel::<OutgoingMessage>(50);
 
     // channel to receive messages from the gateway / ecus
     let mut outrx: HashMap<u16, broadcast::Receiver<Result<DiagnosticResponse, EcuError>>> =

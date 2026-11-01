@@ -25,6 +25,8 @@ pub struct TransmissionParameters {
     pub gateway_address: u16,
     pub timeout_ack: Duration,
     pub ecu_name: String,
+    /// Number of repetitions of a request whose transmission failed
+    /// (`CP_RepeatReqCountTrans`).
     pub repeat_request_count_transmission: u32,
 }
 

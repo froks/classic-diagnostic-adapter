@@ -43,6 +43,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::connection_sender::OutgoingMessage;
+
 pub mod config;
 pub mod error;
 pub use error::{ConnectionError, DoipGatewaySetupError};
@@ -397,7 +399,7 @@ pub(crate) struct GatewaySetup {
 }
 
 struct DoipEcu {
-    sender: mpsc::Sender<DoipPayload>,
+    sender: mpsc::Sender<OutgoingMessage>,
     receiver: broadcast::Receiver<Result<DiagnosticResponse, EcuError>>,
 }
 
@@ -725,35 +727,16 @@ impl<T: EcuAddresses + DoipComParams> PhysicalTransport for DoipDiagGateway<T> {
                     tokio_ext::clear_pending_messages(&mut ecu.receiver);
                     let receiver_flushed = start.elapsed().saturating_sub(lock_acquired);
 
-                    let mut resend_counter = 0;
-                    if let Err(e) = send_with_retries(
-                        &doip_message,
-                        &ecu.sender,
-                        &mut resend_counter,
-                        transmission_params.repeat_request_count_transmission,
-                    )
-                    .await
-                    {
-                        // failed to send the message after exhausting retries.
-                        // informing receiver and giving up.
-                        try_send_transport_response(&response_sender, Err(e)).await;
-                        return;
-                    }
-
-                    let received_event = match wait_for_ack_or_response_until_timeout(
-                        &mut ecu.receiver,
-                        &transmission_params.ecu_name,
-                        &doip_message,
-                        transmission_params.timeout_ack,
-                    )
-                    .await
-                    {
-                        Ok(first) => first,
-                        Err(e) => {
-                            try_send_transport_response(&response_sender, Err(e)).await;
-                            return;
-                        }
-                    };
+                    let received_event =
+                        match send_and_wait_for_ack(&mut ecu, &doip_message, &transmission_params)
+                            .await
+                        {
+                            Ok(first) => first,
+                            Err(e) => {
+                                try_send_transport_response(&response_sender, Err(e)).await;
+                                return;
+                            }
+                        };
 
                     let send_and_ackd_after = start
                         .elapsed()
@@ -869,11 +852,9 @@ impl<T: EcuAddresses + DoipComParams> FunctionalTransport for DoipDiagGateway<T>
         // Clear any pending messages
         tokio_ext::clear_pending_messages(&mut ecu.receiver);
 
-        let mut resend_counter = 0;
-        send_with_retries(
+        transmit_with_retries(
             &doip_message,
             &ecu.sender,
-            &mut resend_counter,
             transmission_params.repeat_request_count_transmission,
         )
         .await?;
@@ -1665,24 +1646,59 @@ impl<T: EcuAddresses + DoipComParams> TransportControl for DoipDiagGateway<T> {
     }
 }
 
-async fn send_with_retries(
+/// Queues `msg` for the gateway sender task and waits until it was written to
+/// the connection. A failed write is repeated up to `max_retries` times
+/// (`CP_RepeatReqCountTrans`); the last attempt asks the sender task to reset
+/// the connection if it fails as well.
+async fn transmit_with_retries(
     msg: &DiagnosticMessage,
-    sender: &mpsc::Sender<DoipPayload>,
-    resend_counter: &mut u32,
+    sender: &mpsc::Sender<OutgoingMessage>,
     max_retries: u32,
 ) -> Result<(), DiagServiceError> {
-    while let Err(e) = sender
-        .send(DoipPayload::DiagnosticMessage(msg.clone()))
-        .await
-    {
-        *resend_counter = resend_counter.saturating_add(1);
-        if *resend_counter > max_retries {
+    let mut retries: u32 = 0;
+    loop {
+        let last_attempt = retries >= max_retries;
+        let (outgoing, written) =
+            OutgoingMessage::new(DoipPayload::DiagnosticMessage(msg.clone()), last_attempt);
+        // A closed channel means the sender task has stopped; repeating cannot help.
+        sender.send(outgoing).await.map_err(|_| {
+            DiagServiceError::SendFailed("DoIP sender task is not running".to_owned())
+        })?;
+        let error = match written.await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "DoIP sender task stopped before sending the message".to_owned(),
+        };
+        if last_attempt {
             return Err(DiagServiceError::SendFailed(format!(
-                "Failed to send message after {max_retries} attempts: {e:?}",
+                "Failed to send message after {} attempts: {error}",
+                retries.saturating_add(1)
             )));
         }
+        retries = retries.saturating_add(1);
+        tracing::warn!(
+            retry = retries,
+            max_retries,
+            %error,
+            "Failed to send message, repeating (CP_RepeatReqCountTrans)"
+        );
     }
-    Ok(())
+}
+
+/// Sends `msg` and waits for its ACK.
+async fn send_and_wait_for_ack(
+    ecu: &mut DoipEcu,
+    msg: &DiagnosticMessage,
+    params: &TransmissionParameters,
+) -> Result<Option<DiagnosticResponse>, DiagServiceError> {
+    transmit_with_retries(msg, &ecu.sender, params.repeat_request_count_transmission).await?;
+    wait_for_ack_or_response_until_timeout(
+        &mut ecu.receiver,
+        &params.ecu_name,
+        msg,
+        params.timeout_ack,
+    )
+    .await
 }
 
 #[tracing::instrument(skip_all,
@@ -1718,9 +1734,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        ConnectionTasks, DiagnosticResponse, DoIPUdpSocket, DoipConfig, DoipConnection,
-        DoipDiagGateway, DoipEcu, DoipGatewayState, config::DiscoveryMode, read_ecu_responses,
-        spawn_connection_task, test_helpers::TestEcu, wait_for_ack_or_response_until_timeout,
+        ConnectionError, ConnectionTasks, DiagnosticResponse, DoIPUdpSocket, DoipConfig,
+        DoipConnection, DoipDiagGateway, DoipEcu, DoipGatewayState, config::DiscoveryMode,
+        connection_sender::OutgoingMessage, read_ecu_responses, spawn_connection_task,
+        test_helpers::TestEcu, transmit_with_retries, wait_for_ack_or_response_until_timeout,
     };
 
     const ECU_ADDR: u16 = 0x0E80;
@@ -1745,17 +1762,16 @@ mod tests {
     }
 
     /// Builds a minimal `DoipDiagGateway` whose single ECU is backed by the
-    /// caller-supplied broadcast receiver and mpsc sender.
+    /// caller-supplied broadcast receiver and outgoing message sender.
     ///
-    /// The mpsc `_doip_payload_rx` must be kept alive by the caller for the
-    /// duration of the test; `send_with_retries` writes into it and will error
-    /// if the receiver is dropped before it gets a chance to send.
+    /// Something must complete the messages queued on `outgoing_tx` (see
+    /// [`spawn_fake_writer`]), otherwise `send()` waits for the write forever.
     fn make_gateway(
         broadcast_rx: broadcast::Receiver<Result<DiagnosticResponse, crate::connections::EcuError>>,
-        doip_payload_tx: mpsc::Sender<DoipPayload>,
+        outgoing_tx: mpsc::Sender<OutgoingMessage>,
     ) -> DoipDiagGateway<TestEcu> {
         let ecu = Arc::new(Mutex::new(DoipEcu {
-            sender: doip_payload_tx,
+            sender: outgoing_tx,
             receiver: broadcast_rx,
         }));
 
@@ -2481,69 +2497,105 @@ mod tests {
     type SendResult = Result<tokio::task::JoinHandle<()>, cda_interfaces::DiagServiceError>;
     type ResponseItem = Result<Option<TransportResponse>, cda_interfaces::DiagServiceError>;
 
+    /// A message handled by [`spawn_fake_writer`]: its payload and whether the
+    /// sender asked for a connection reset in case the write fails.
+    type WrittenMessage = (DoipPayload, bool);
+
+    /// Stands in for the gateway sender task: completes the queued messages
+    /// with `outcomes` in order (`Ok` once they are used up) and forwards each
+    /// message to the returned receiver before completing it.
+    fn spawn_fake_writer(
+        mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
+        outcomes: Vec<Result<(), ConnectionError>>,
+    ) -> mpsc::UnboundedReceiver<WrittenMessage> {
+        let (written_tx, written_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut outcomes = outcomes.into_iter();
+            while let Some(msg) = outgoing_rx.recv().await {
+                let _ = written_tx.send((msg.payload().clone(), msg.reset_on_failure()));
+                msg.complete(outcomes.next().unwrap_or(Ok(())));
+            }
+        });
+        written_rx
+    }
+
+    fn write_error() -> ConnectionError {
+        ConnectionError::SendFailed("broken pipe".to_owned())
+    }
+
+    /// Collects the messages written so far, in order.
+    fn drain_written(
+        written_rx: &mut mpsc::UnboundedReceiver<WrittenMessage>,
+    ) -> Vec<WrittenMessage> {
+        std::iter::from_fn(|| written_rx.try_recv().ok()).collect()
+    }
+
     /// Shared test harness.
     ///
     /// Owns every channel handle that must stay alive for the duration of a
     /// test:
     /// - `broadcast_tx` - injects simulated ECU responses.
-    /// - `_doip_payload_rx` - keeps the mpsc sender alive so `send_with_retries`
-    ///   does not error out trying to write the outgoing `DoIP` frame.
+    /// - `written_rx` - reports each message the `send()` task wrote, see
+    ///   [`spawn_fake_writer`].
     /// - `send_handle` - join handle for the background `send()` task.
     /// - `response_rx` - receives the UDS responses forwarded by `send()`.
     struct TestHarness {
         broadcast_tx: broadcast::Sender<Result<DiagnosticResponse, crate::connections::EcuError>>,
-        _doip_payload_rx: mpsc::Receiver<DoipPayload>,
+        written_rx: mpsc::UnboundedReceiver<WrittenMessage>,
         send_handle: tokio::task::JoinHandle<SendResult>,
         response_rx: mpsc::Receiver<ResponseItem>,
     }
 
     impl TestHarness {
-        /// Creates the gateway, spawns the `send()` task, and advances it past
-        /// `clear_pending_messages` to the point where it is blocked on
-        /// `ecu.receiver.recv()` inside the `'ack_waiting` loop.
-        ///
-        /// Uses `current_thread` flavor (see test attributes) so that
-        /// `yield_now()` is a reliable synchronization primitive: on a
-        /// cooperative single-threaded executor each yield hands control to
-        /// exactly the next scheduled task.  The spawned task must pass through
-        /// the following `.await` points before reaching `recv()`:
-        ///
-        ///   1. `ecu_mtx.lock().await` - acquires the ECU mutex
-        ///   2. `send_with_retries(...).await` - writes the outgoing `DoIP` frame
-        ///   3. `tokio::time::timeout(...)` - enters the ACK-wait future
-        ///   4. `ecu.receiver.recv().await` - now blocked, ready for injection
-        ///
-        /// Crucially, `clear_pending_messages` runs between steps 1 and 2.
-        /// We must yield past it before calling `broadcast_tx.send()`, otherwise
-        /// the injected message would be drained and the task would block forever.
-        /// One `yield_now()` per await point, plus one safety margin = 5 total.
+        /// Starts a `send()` with default parameters and returns once the
+        /// request was written, i.e. the task is waiting for the ACK.
         async fn new() -> Self {
-            let (broadcast_tx, broadcast_rx) =
-                broadcast::channel::<Result<DiagnosticResponse, crate::connections::EcuError>>(1);
-            let (doip_payload_tx, doip_payload_rx) = mpsc::channel::<DoipPayload>(1);
+            let mut harness = Self::start(transmission_params(), Vec::new());
+            harness.next_written().await;
+            harness
+        }
 
-            let gateway = make_gateway(broadcast_rx, doip_payload_tx);
+        /// Creates the gateway and spawns the `send()` task. Writes complete
+        /// with `write_outcomes` in order, then succeed.
+        ///
+        /// Messages injected on `broadcast_tx` before a write was reported may
+        /// be discarded by the pre-send drain; wait for [`Self::next_written`]
+        /// first.
+        fn start(
+            params: TransmissionParameters,
+            write_outcomes: Vec<Result<(), ConnectionError>>,
+        ) -> Self {
+            let (broadcast_tx, broadcast_rx) =
+                broadcast::channel::<Result<DiagnosticResponse, crate::connections::EcuError>>(4);
+            let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
+            let written_rx = spawn_fake_writer(outgoing_rx, write_outcomes);
+
+            let gateway = make_gateway(broadcast_rx, outgoing_tx);
 
             let (response_tx, response_rx) = mpsc::channel::<ResponseItem>(1);
             let send_handle = tokio::spawn({
                 let gateway = gateway.clone();
                 async move {
                     gateway
-                        .send(transmission_params(), service_payload(), response_tx, true)
+                        .send(params, service_payload(), response_tx, true)
                         .await
                 }
             });
 
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-
             Self {
                 broadcast_tx,
-                _doip_payload_rx: doip_payload_rx,
+                written_rx,
                 send_handle,
                 response_rx,
             }
+        }
+
+        /// Waits until the `send()` task wrote its next message.
+        async fn next_written(&mut self) -> WrittenMessage {
+            tokio::time::timeout(Duration::from_millis(500), self.written_rx.recv())
+                .await
+                .expect("timed out waiting for the send() task to write")
+                .expect("writer stopped unexpectedly")
         }
 
         /// Waits for the next response from the background `send()` task.
@@ -2558,8 +2610,7 @@ mod tests {
         }
     }
 
-    // current_thread: yield_now() in TestHarness::new() must be a reliable sync point.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn implicit_ack_busy_retry_then_final_response() {
         let mut harness = TestHarness::new().await;
 
@@ -2609,8 +2660,7 @@ mod tests {
             .expect("send() returned an error");
     }
 
-    // current_thread: yield_now() in TestHarness::new() must be a reliable sync point.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn implicit_ack_single_response() {
         let mut harness = TestHarness::new().await;
 
@@ -2633,6 +2683,88 @@ mod tests {
             .expect("send task panicked")
             .expect("send() returned an error");
     }
+    /// A failed write is repeated (`CP_RepeatReqCountTrans`); only the last
+    /// allowed attempt asks for a connection reset, and it is not reached here.
+    #[tokio::test]
+    async fn transmit_with_retries_repeats_failed_write() {
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(1);
+        let mut written_rx =
+            spawn_fake_writer(outgoing_rx, vec![Err(write_error()), Err(write_error())]);
+
+        let result = transmit_with_retries(&diag_msg(), &outgoing_tx, 3).await;
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let resets: Vec<bool> = drain_written(&mut written_rx)
+            .into_iter()
+            .map(|(_, reset)| reset)
+            .collect();
+        assert_eq!(resets, vec![false, false, false]);
+    }
+
+    /// When every attempt fails, the request fails with `SendFailed` after
+    /// `1 + CP_RepeatReqCountTrans` attempts and the last one requests a reset.
+    #[tokio::test]
+    async fn transmit_with_retries_requests_reset_when_retries_exhausted() {
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(1);
+        let mut written_rx = spawn_fake_writer(
+            outgoing_rx,
+            vec![Err(write_error()), Err(write_error()), Err(write_error())],
+        );
+
+        let result = transmit_with_retries(&diag_msg(), &outgoing_tx, 2).await;
+
+        assert!(
+            matches!(result, Err(DiagServiceError::SendFailed(_))),
+            "expected SendFailed, got {result:?}"
+        );
+        let written = drain_written(&mut written_rx);
+        let resets: Vec<bool> = written.iter().map(|(_, reset)| *reset).collect();
+        assert_eq!(resets, vec![false, false, true]);
+        assert!(
+            written
+                .iter()
+                .all(|(payload, _)| *payload == DoipPayload::DiagnosticMessage(diag_msg())),
+            "every attempt must send the original message"
+        );
+    }
+
+    /// A stopped sender task cannot recover; the request fails right away
+    /// instead of repeating against the closed channel.
+    #[tokio::test]
+    async fn transmit_with_retries_fails_once_when_sender_task_stopped() {
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
+        drop(outgoing_rx);
+
+        let result = transmit_with_retries(&diag_msg(), &outgoing_tx, 3).await;
+
+        assert!(
+            matches!(result, Err(DiagServiceError::SendFailed(_))),
+            "expected SendFailed, got {result:?}"
+        );
+    }
+
+    /// A failed write inside `send()` is repeated before waiting for the ACK.
+    #[tokio::test]
+    async fn send_repeats_failed_write_then_reads_response() {
+        let params = TransmissionParameters {
+            repeat_request_count_transmission: 1,
+            ..transmission_params()
+        };
+        let mut harness = TestHarness::start(params, vec![Err(write_error())]);
+        harness.next_written().await;
+        harness.next_written().await;
+
+        harness
+            .broadcast_tx
+            .send(Ok(ecu_msg_response()))
+            .expect("Failed to send response");
+        let response = harness.recv_response().await;
+        assert!(
+            matches!(response, Ok(Some(TransportResponse::UdsResponse(_)))),
+            "expected Message, got {response:?}"
+        );
+    }
+
     #[tokio::test]
     async fn wait_for_ack_or_response_ok_none_on_explicit_ack() {
         let (tx, mut rx) = make_broadcast_pair();

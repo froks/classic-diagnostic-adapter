@@ -17,7 +17,7 @@ use cda_interfaces::dlt_ctx;
 use doip_definitions::payload::{AliveCheckResponse, DoipPayload};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     time::Interval,
 };
 
@@ -25,7 +25,78 @@ use crate::{
     DiagnosticResponse,
     connections::{ConnectionResetReason, try_read},
     ecu_connection::{ECUConnectionSend as _, EcuConnectionTarget},
+    error::ConnectionError,
 };
+
+/// A `DoIP` payload queued for the gateway sender task.
+pub(crate) struct OutgoingMessage {
+    payload: DoipPayload,
+    /// Receives the outcome of writing `payload` to the connection.
+    written: oneshot::Sender<Result<(), ConnectionError>>,
+    /// Requests a connection reset when the write fails. Set on the last
+    /// transmission attempt, when the failure is persistent.
+    reset_on_failure: bool,
+}
+
+impl OutgoingMessage {
+    /// Creates the message and the receiver for its write outcome.
+    pub(crate) fn new(
+        payload: DoipPayload,
+        reset_on_failure: bool,
+    ) -> (Self, oneshot::Receiver<Result<(), ConnectionError>>) {
+        let (written, written_rx) = oneshot::channel();
+        (
+            Self {
+                payload,
+                written,
+                reset_on_failure,
+            },
+            written_rx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload(&self) -> &DoipPayload {
+        &self.payload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_on_failure(&self) -> bool {
+        self.reset_on_failure
+    }
+
+    /// Reports the write outcome to the requester, like the sender task does.
+    #[cfg(test)]
+    pub(crate) fn complete(self, result: Result<(), ConnectionError>) {
+        let _ = self.written.send(result);
+    }
+}
+
+/// Writes `payload` to the gateway connection within `send_timeout`.
+async fn write_payload<T>(
+    gateway_connection: &EcuConnectionTarget<T>,
+    payload: DoipPayload,
+    send_timeout: Duration,
+) -> Result<(), ConnectionError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut guard = gateway_connection.lock_send().await?;
+    match tokio::time::timeout(send_timeout, guard.get_sender().send(payload)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "Failed to send message");
+            Err(e)
+        }
+        Err(_) => {
+            tracing::error!(timeout = ?send_timeout, "Timeout sending message");
+            Err(ConnectionError::Timeout(format!(
+                "Message not sent within {} ms",
+                send_timeout.as_millis()
+            )))
+        }
+    }
+}
 
 #[tracing::instrument(
     skip_all,
@@ -35,7 +106,7 @@ use crate::{
 )]
 pub(crate) fn spawn_gateway_sender_task<T>(
     gateway_connection: Arc<EcuConnectionTarget<T>>,
-    mut inrx: mpsc::Receiver<DoipPayload>,
+    mut inrx: mpsc::Receiver<OutgoingMessage>,
     reset_tx: mpsc::Sender<ConnectionResetReason>,
     send_pending_tx: watch::Sender<bool>,
 ) -> tokio::task::JoinHandle<()>
@@ -86,7 +157,7 @@ where
                     // https://docs.rs/tokio/latest/tokio/macro.select.html#fairness
                     biased;
                     msg = inrx.recv() => {
-                        let Some(msg) = msg else {
+                        let Some(OutgoingMessage { payload, written, reset_on_failure }) = msg else {
                             // Channel closed - all senders dropped (gateway shut down).
                             tracing::debug!("Send channel closed, shutting down sender task");
                             break;
@@ -97,36 +168,35 @@ where
                         }
 
                         let start = std::time::Instant::now();
-                        let lock_after = match gateway_connection.lock_send().await {
-                            Ok(mut guard) => {
-                                let conn = guard.get_sender();
-                                let lock_after = start.elapsed();
-
-                                match tokio::time::timeout(send_timeout, conn.send(msg)).await {
-                                    Ok(Ok(())) => {},
-                                    Ok(Err(e)) => {
-                                        tracing::error!(error = ?e, "Failed to send message");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = ?e, "Timeout sending message");
-                                    }
-                                }
-                                lock_after
-                            },
-                            Err(_) => {
-                                continue; // connection was closed
-                            }
-                        };
-
-                        let send_after = start.elapsed().saturating_sub(lock_after);
+                        let result = write_payload(&gateway_connection, payload, send_timeout).await;
                         tracing::debug!(
                             total_duration = ?start.elapsed(),
-                            lock_duration = ?lock_after,
-                            send_duration = ?send_after,
+                            success = result.is_ok(),
                             "DoIP send request timing"
                         );
+
+                        let reset_reason = match &result {
+                            Err(e) if reset_on_failure => Some(format!("Unable to send message: {e}")),
+                            _ => None,
+                        };
+                        // The requester may have given up waiting; nothing to report then.
+                        let _ = written.send(result);
+
                         // inform the rx task that we are done sending
                         if send_pending_status(&send_pending_tx, false).is_err() {
+                            break;
+                        }
+
+                        // The last transmission attempt failed as well: the
+                        // connection is considered broken.
+                        if let Some(reason) = reset_reason
+                            && let Err(e) = reset_tx.send(reason).await
+                        {
+                            tracing::error!(
+                                error = ?e,
+                                "Failed to send connection reset request"
+                            );
+                            // Without the reset channel the connection cannot recover.
                             break;
                         }
                         // Reset the alive check timer so it only fires after a full
@@ -260,8 +330,8 @@ mod tests {
     use tokio::sync::{Mutex, mpsc, watch};
 
     use crate::{
-        DoipTransportConfig, GatewayDoipConfig,
-        connection_sender::spawn_gateway_sender_task,
+        ConnectionError, DoipTransportConfig, GatewayDoipConfig,
+        connection_sender::{OutgoingMessage, spawn_gateway_sender_task},
         connections::ConnectionResetReason,
         ecu_connection::{EcuConnectionReadVariant, EcuConnectionSendVariant, EcuConnectionTarget},
         socket::{DoIPConnection, DoipSocketConfig},
@@ -320,7 +390,7 @@ mod tests {
     ///
     /// The test then uses the returned handles to drive the scenario.
     struct GatewaySenderTestHarness {
-        msg_tx: mpsc::Sender<DoipPayload>,
+        msg_tx: mpsc::Sender<OutgoingMessage>,
         reset_rx: mpsc::Receiver<ConnectionResetReason>,
         _gateway_conn: Arc<EcuConnectionTarget<tokio::io::DuplexStream>>,
         _send_pending_rx: watch::Receiver<bool>,
@@ -331,7 +401,7 @@ mod tests {
         fn new(alive_check_interval: Duration) -> Self {
             tokio::time::pause();
 
-            let (msg_tx, msg_rx) = mpsc::channel::<DoipPayload>(10);
+            let (msg_tx, msg_rx) = mpsc::channel::<OutgoingMessage>(10);
             let (reset_tx, reset_rx) = mpsc::channel::<ConnectionResetReason>(10);
             let (send_pending_tx, send_pending_rx) = watch::channel(false);
             let (gateway_target, _) = duplex_ecu_connection_target(alive_check_interval);
@@ -364,10 +434,11 @@ mod tests {
         /// After sending, we yield once so the sender task is polled and actually
         /// processes the message.
         async fn send_dummy_message(&self) {
-            self.msg_tx
-                .send(DoipPayload::EntityStatusRequest(EntityStatusRequest {}))
-                .await
-                .unwrap();
+            let (msg, _written) = OutgoingMessage::new(
+                DoipPayload::EntityStatusRequest(EntityStatusRequest {}),
+                false,
+            );
+            self.msg_tx.send(msg).await.unwrap();
             tokio::task::yield_now().await;
         }
     }
@@ -486,5 +557,99 @@ mod tests {
         // Clean up: abort the task.
         harness.task.abort();
         let _ = harness.task.await;
+    }
+
+    /// Spawns the sender task on a duplex connection without alive checks.
+    /// Dropping the returned server side makes every write fail.
+    fn spawn_sender() -> (
+        mpsc::Sender<OutgoingMessage>,
+        mpsc::Receiver<ConnectionResetReason>,
+        watch::Receiver<bool>,
+        crate::socket::DoIPConnection<tokio::io::DuplexStream>,
+    ) {
+        let (msg_tx, msg_rx) = mpsc::channel::<OutgoingMessage>(10);
+        let (reset_tx, reset_rx) = mpsc::channel::<ConnectionResetReason>(10);
+        let (send_pending_tx, send_pending_rx) = watch::channel(false);
+        let (gateway_target, server) = duplex_ecu_connection_target(Duration::ZERO);
+        spawn_gateway_sender_task(Arc::new(gateway_target), msg_rx, reset_tx, send_pending_tx);
+        (msg_tx, reset_rx, send_pending_rx, server)
+    }
+
+    fn entity_status_request() -> DoipPayload {
+        DoipPayload::EntityStatusRequest(EntityStatusRequest {})
+    }
+
+    /// A successful write is reported to the requester.
+    #[tokio::test]
+    async fn sender_reports_successful_write() {
+        let (msg_tx, _reset_rx, _send_pending_rx, _server) = spawn_sender();
+
+        let (msg, written) = OutgoingMessage::new(entity_status_request(), true);
+        msg_tx.send(msg).await.expect("Failed to queue message");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), written)
+            .await
+            .expect("timed out waiting for write outcome")
+            .expect("sender task dropped the message");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    /// A failed write is reported to the requester. Without `reset_on_failure`
+    /// the connection is left alone, so the request can be repeated.
+    #[tokio::test]
+    async fn sender_reports_failed_write_without_reset() {
+        let (msg_tx, mut reset_rx, mut send_pending_rx, server) = spawn_sender();
+        drop(server);
+
+        let (msg, written) = OutgoingMessage::new(entity_status_request(), false);
+        msg_tx.send(msg).await.expect("Failed to queue message");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), written)
+            .await
+            .expect("timed out waiting for write outcome")
+            .expect("sender task dropped the message");
+        assert!(
+            matches!(result, Err(ConnectionError::SendFailed(_))),
+            "expected SendFailed, got {result:?}"
+        );
+
+        // The task is done with the message once it cleared the send-pending flag.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            send_pending_rx.wait_for(|pending| !pending),
+        )
+        .await
+        .expect("send pending flag not cleared")
+        .expect("sender task stopped");
+        assert!(
+            reset_rx.try_recv().is_err(),
+            "no reset expected before the last attempt"
+        );
+    }
+
+    /// When the last transmission attempt fails, the sender task requests a
+    /// connection reset after reporting the failure.
+    #[tokio::test]
+    async fn sender_requests_reset_when_last_attempt_fails() {
+        let (msg_tx, mut reset_rx, _send_pending_rx, server) = spawn_sender();
+        drop(server);
+
+        let (msg, written) = OutgoingMessage::new(entity_status_request(), true);
+        msg_tx.send(msg).await.expect("Failed to queue message");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), written)
+            .await
+            .expect("timed out waiting for write outcome")
+            .expect("sender task dropped the message");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+
+        let reason = tokio::time::timeout(Duration::from_secs(1), reset_rx.recv())
+            .await
+            .expect("timed out waiting for reset request")
+            .expect("reset channel closed");
+        assert!(
+            reason.contains("Unable to send message"),
+            "unexpected reset reason: {reason}"
+        );
     }
 }
