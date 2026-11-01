@@ -379,9 +379,8 @@ impl EcuAddresses for TestEcuDb {
 }
 
 impl DoipComParams for TestEcuDb {
-    fn nack_number_of_retries(&self) -> &HashMap<u8, u32> {
-        static EMPTY: std::sync::OnceLock<HashMap<u8, u32>> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(HashMap::new)
+    fn nack_number_of_retries(&self) -> u32 {
+        0
     }
     fn diagnostic_ack_timeout(&self) -> Duration {
         Duration::from_secs(2)

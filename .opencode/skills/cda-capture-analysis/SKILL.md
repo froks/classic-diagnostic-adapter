@@ -100,7 +100,8 @@ MDD path) to read the com params of the ECU variant and protocol (`UDS_Ethernet_
 | `CP_DoIPLogicalEcuAddress`, `CP_DoIPLogicalTesterAddress`, `CP_DoIPLogicalGatewayAddress`, `CP_DoIPLogicalFunctionalAddress` | addressing | DoIP SA/TA |
 | `CP_DoIPDiagnosticAckTimeout` | wait for DoIP 0x8002/0x8003 | request -> diag ACK |
 | `CP_DoIPRoutingActivationTimeout` | wait for 0x0006 | 0x0005 -> 0x0006 |
-| `CP_DoIPNumberOfRetries`, `CP_DoIPRetryPeriod`, `CP_RepeatReqCountTrans` | NACK retries | retries after 0x8003 |
+| `CP_DoIPNumberOfRetries`, `CP_DoIPRetryPeriod` | OUT_OF_MEMORY NACK retries | 0x8003 with code 0x05 -> repeated request |
+| `CP_RepeatReqCountTrans` | transmission retries | failed TCP write -> repeated request |
 | `CP_DoIPConnectionTimeout`, `CP_DoIPConnectionRetryDelay`, `CP_DoIPConnectionRetryAttempts` | TCP connect | SYN retries / spacing |
 | `CP_CanPhysReqId`, `CP_CanRespUSDTId`, `CP_CanFuncReqId`, `CP_UniqueRespIdTable` | CAN IDs | CAN IDs in capture |
 | ISO-TP `CP_As/Ar/Bs/Br/Cs/Cr`, `CP_BlockSize`, `CP_STmin` | ECU / ISO-TP timing | server response times, FC parameters |

@@ -294,19 +294,15 @@ pub struct DoipComParams {
     /// Logical address of the tester
     pub logical_tester_address: ComParamConfig<u16>,
 
-    // todo use this in #22
-    /// Number of retries for specific NACKs
-    /// The key must be a string, because parsing from toml requires keys to be strings,
-    /// no other types are supported.
-    pub nack_number_of_retries: ComParamConfig<HashMap<String, u32>>,
+    /// Number of retries after a diagnostic message NACK with code
+    /// `OUT_OF_MEMORY` (`0x05`). Other NACK codes are not retried.
+    pub nack_number_of_retries: ComParamConfig<u32>,
 
-    // todo use this n #22
     /// Maximum time the tester waits for an ACK or NACK of the `DoIP` entity
     #[schemars(schema_with = "duration_param_schema")]
     pub diagnostic_ack_timeout: ComParamConfig<Duration>,
 
-    // todo use this n #22
-    /// Period between retries, after specific NACK conditions are encountered
+    /// Period between retries after a diagnostic message NACK with code `OUT_OF_MEMORY`
     #[schemars(schema_with = "duration_param_schema")]
     pub retry_period: ComParamConfig<Duration>,
 
@@ -565,11 +561,7 @@ impl Default for DoipComParams {
             },
             nack_number_of_retries: ComParamConfig {
                 name: "CP_DoIPNumberOfRetries".to_owned(),
-                value: [
-                    ("0x03".to_owned(), 3), // Out of memory
-                ]
-                .into_iter()
-                .collect(),
+                value: 3,
                 precedence: ComParamPrecedence::Database,
             },
             diagnostic_ack_timeout: ComParamConfig {

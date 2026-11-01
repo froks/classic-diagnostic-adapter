@@ -114,15 +114,15 @@ Communication Parameters
          - 0
          -
        * - CP_DoIPNumberOfRetries
-         - Number of retries for specific diagnostic message NACKs
-         - 3 (for OUT_OF_MEMORY)
-         - Retry count is configured per NACK code
+         - Number of retries after a Diagnostic Message NACK with code OUT_OF_MEMORY (``0x05``)
+         - 3
+         - Applies only to OUT_OF_MEMORY; other NACK codes are not retried
        * - CP_DoIPDiagnosticAckTimeout
          - Maximum time the tester waits for an ACK or NACK from the DoIP entity
          - 1s
          -
        * - CP_DoIPRetryPeriod
-         - Period between retries after specific NACK conditions are encountered
+         - Period between retries after an OUT_OF_MEMORY NACK
          - 200ms
          -
        * - CP_DoIPRoutingActivationTimeout
@@ -367,8 +367,9 @@ Diagnostic Message Exchange
 
     - The CDA shall wait for a Diagnostic Message ACK (``0x8002``) or NACK (``0x8003``)
       within ``CP_DoIPDiagnosticAckTimeout``.
-    - On NACK, the CDA shall retry based on ``CP_DoIPNumberOfRetries`` with
-      ``CP_DoIPRetryPeriod`` delay between attempts, depending on the NACK code.
+    - On a NACK with code OUT_OF_MEMORY (``0x05``), the CDA shall retry up to
+      ``CP_DoIPNumberOfRetries`` times with ``CP_DoIPRetryPeriod`` delay between attempts.
+      The CDA shall report any other NACK code as error.
 
     **Response Forwarding**
 
@@ -399,7 +400,7 @@ Diagnostic Message Exchange
             note right: Within\nCP_DoIPDiagnosticAckTimeout
         else NACK
             GW --> CDA: Diagnostic Message NACK (0x8003)\n[nack_code]
-            note right of CDA: Retry per\nCP_DoIPNumberOfRetries
+            note right of CDA: OUT_OF_MEMORY: retry per\nCP_DoIPNumberOfRetries\nOther codes: report error
         end
 
         == Receive Response ==
@@ -483,8 +484,9 @@ Error Handling
     - **Routing activation errors**: The CDA shall report routing activation failures
       for non-recoverable denial codes. For TLS-required denials, the CDA shall
       automatically fall back to a TLS connection.
-    - **Diagnostic message NACKs**: The CDA shall retry based on the NACK code,
-      ``CP_DoIPNumberOfRetries``, and ``CP_DoIPRetryPeriod``.
+    - **Diagnostic message NACKs**: The CDA shall retry a NACK with code OUT_OF_MEMORY
+      up to ``CP_DoIPNumberOfRetries`` times with ``CP_DoIPRetryPeriod`` delay and report
+      any other NACK code as error.
     - **Transmission errors**: The CDA shall retry up to ``CP_RepeatReqCountTrans`` times.
     - **ACK timeouts**: The CDA shall report a timeout error to the caller when no
       ACK/NACK is received within ``CP_DoIPDiagnosticAckTimeout``.

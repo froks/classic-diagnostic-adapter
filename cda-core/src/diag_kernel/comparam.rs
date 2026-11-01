@@ -18,10 +18,7 @@
 
 use std::time::Duration;
 
-use cda_interfaces::{
-    HashMap,
-    datatypes::{AddressingMode, RetryPolicy, TesterPresentSendType},
-};
+use cda_interfaces::datatypes::{AddressingMode, RetryPolicy, TesterPresentSendType};
 use cda_plugin_security::SecurityPlugin;
 
 use super::ecumanager::EcuManager;
@@ -87,8 +84,8 @@ impl<S: SecurityPlugin> cda_interfaces::UdsComParams for EcuManager<S> {
 }
 
 impl<S: SecurityPlugin> cda_interfaces::DoipComParams for EcuManager<S> {
-    fn nack_number_of_retries(&self) -> &HashMap<u8, u32> {
-        &self.nack_number_of_retries
+    fn nack_number_of_retries(&self) -> u32 {
+        self.nack_number_of_retries
     }
     fn diagnostic_ack_timeout(&self) -> Duration {
         self.diagnostic_ack_timeout

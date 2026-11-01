@@ -13,10 +13,7 @@
 
 use std::time::Duration;
 
-use crate::{
-    HashMap,
-    datatypes::{AddressingMode, RetryPolicy, TesterPresentSendType},
-};
+use crate::datatypes::{AddressingMode, RetryPolicy, TesterPresentSendType};
 
 pub trait UdsComParams: Send + Sync + 'static {
     #[must_use]
@@ -61,7 +58,9 @@ pub trait UdsComParams: Send + Sync + 'static {
 
 pub trait DoipComParams: Send + Sync + 'static {
     #[must_use]
-    fn nack_number_of_retries(&self) -> &HashMap<u8, u32>;
+    /// Number of retries after a diagnostic message NACK with code
+    /// `OUT_OF_MEMORY` (`CP_DoIPNumberOfRetries`).
+    fn nack_number_of_retries(&self) -> u32;
     #[must_use]
     fn diagnostic_ack_timeout(&self) -> Duration;
     #[must_use]

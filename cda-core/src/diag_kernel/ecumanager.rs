@@ -98,7 +98,7 @@ pub struct EcuManager<S: SecurityPlugin> {
     pub(in crate::diag_kernel) can_ids: Option<cda_interfaces::CanIds>,
     pub(in crate::diag_kernel) can_functional_id: Option<cda_interfaces::CanId>,
 
-    pub(in crate::diag_kernel) nack_number_of_retries: HashMap<u8, u32>,
+    pub(in crate::diag_kernel) nack_number_of_retries: u32,
     pub(in crate::diag_kernel) diagnostic_ack_timeout: Duration,
     pub(in crate::diag_kernel) retry_period: Duration,
     pub(in crate::diag_kernel) routing_activation_timeout: Duration,
@@ -626,11 +626,8 @@ impl<S: SecurityPlugin> EcuManager<S> {
             ),
         );
 
-        let nack_number_of_retries = database
-            .find_com_param(data_protocol_ref, &com_params.doip.nack_number_of_retries)?
-            .iter()
-            .map(datatypes::map_nack_number_of_retries)
-            .collect::<Result<HashMap<u8, u32>, DiagServiceError>>()?;
+        let nack_number_of_retries =
+            database.find_com_param(data_protocol_ref, &com_params.doip.nack_number_of_retries)?;
 
         // Per-ECU CAN addressing lives in the unique-response-ID table (one
         // row per ECU description); resolve it once and let all three ID
@@ -794,13 +791,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
     ) -> Result<Self, DiagServiceError> {
         // Functional group description: use defaults for all com params
         let logical_ecu_address = com_params.doip.logical_ecu_address.value;
-        let nack_number_of_retries = com_params
-            .doip
-            .nack_number_of_retries
-            .value
-            .iter()
-            .map(datatypes::map_nack_number_of_retries)
-            .collect::<Result<HashMap<u8, u32>, DiagServiceError>>()?;
+        let nack_number_of_retries = com_params.doip.nack_number_of_retries.value;
 
         let ecu_name = database
             .ecu_data()?

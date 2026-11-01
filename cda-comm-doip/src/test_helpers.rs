@@ -10,9 +10,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{sync::OnceLock, time::Duration};
+use std::time::Duration;
 
-use cda_interfaces::{DoipComParams, EcuAddresses, HashMap, HashMapExtensions};
+use cda_interfaces::{DoipComParams, EcuAddresses};
 
 /// Lightweight ECU fixture for `DoIP` unit tests.
 #[derive(Clone, Debug)]
@@ -63,9 +63,8 @@ impl EcuAddresses for TestEcu {
 }
 
 impl DoipComParams for TestEcu {
-    fn nack_number_of_retries(&self) -> &HashMap<u8, u32> {
-        static EMPTY: OnceLock<HashMap<u8, u32>> = OnceLock::new();
-        EMPTY.get_or_init(HashMap::new)
+    fn nack_number_of_retries(&self) -> u32 {
+        0
     }
 
     fn diagnostic_ack_timeout(&self) -> Duration {
@@ -116,7 +115,7 @@ mod tests {
         assert_eq!(ecu.logical_functional_address(), 0xE400);
         assert_eq!(ecu.ecu_name(), "test");
         assert!(ecu.logical_address_eq(&other));
-        assert!(ecu.nack_number_of_retries().is_empty());
+        assert_eq!(ecu.nack_number_of_retries(), 0);
         assert_eq!(ecu.diagnostic_ack_timeout(), Duration::from_secs(2));
         assert_eq!(ecu.retry_period(), Duration::from_millis(100));
         assert_eq!(ecu.routing_activation_timeout(), Duration::from_secs(5));

@@ -517,7 +517,7 @@ enabled = true
 endpoint = "http://jaeger:4317"
 
 [com_params.doip]
-nack_number_of_retries.value = {"0x03" = 42, "0x04" = 43}
+nack_number_of_retries.value = 42
 nack_number_of_retries.name = "CP_TEST"
 
 [functional_description]
@@ -541,24 +541,7 @@ priority_lifecycle_queue_capacity = 32
             Configuration::default().flash_functional_class_default,
             "flash_download_upload"
         );
-        assert_eq!(
-            config
-                .com_params
-                .doip
-                .nack_number_of_retries
-                .value
-                .get("0x03"),
-            Some(&42)
-        );
-        assert_eq!(
-            config
-                .com_params
-                .doip
-                .nack_number_of_retries
-                .value
-                .get("0x04"),
-            Some(&43)
-        );
+        assert_eq!(config.com_params.doip.nack_number_of_retries.value, 42);
         assert_eq!(
             config.com_params.doip.nack_number_of_retries.name,
             "CP_TEST"

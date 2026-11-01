@@ -198,15 +198,15 @@ Communication Parameters
          - 0
          -
        * - CP_DoIPNumberOfRetries
-         - Number of retries for specific diagnostic message NACKs
-         - 3 (for OUT_OF_MEMORY)
-         - Retry count is configured per NACK code
+         - Number of retries after a Diagnostic Message NACK with code OUT_OF_MEMORY (``0x05``)
+         - 3
+         - Applies only to OUT_OF_MEMORY; other NACK codes are not retried
        * - CP_DoIPDiagnosticAckTimeout
          - Maximum time the tester waits for an ACK or NACK from the DoIP entity
          - 1s
          -
        * - CP_DoIPRetryPeriod
-         - Period between retries after specific NACK conditions are encountered
+         - Period between retries after an OUT_OF_MEMORY NACK
          - 200ms
          -
        * - CP_DoIPRoutingActivationTimeout
@@ -600,8 +600,9 @@ Diagnostic Message Exchange
       The ACK may contain the original message for verification. If the contained message
       does not match the sent message, the CDA continues waiting for the correct ACK.
     - **Diagnostic Message NACK** (``0x8003``): The message was rejected. The NACK code
-      indicates the reason. Depending on the code and ``CP_DoIPNumberOfRetries``, the
-      message may be retried after ``CP_DoIPRetryPeriod``.
+      indicates the reason. A NACK with code OUT_OF_MEMORY (``0x05``) is retried up to
+      ``CP_DoIPNumberOfRetries`` times, each after ``CP_DoIPRetryPeriod``. Any other NACK
+      code is reported as error.
     - **Generic NACK** (``0x0000``): A protocol-level error occurred. Reported as error.
     - **Timeout**: No ACK or NACK received within the timeout. Reported as timeout error.
 
@@ -746,7 +747,7 @@ Diagnostic Message Exchange
 
         else NACK received
             GW --> CDA: Diagnostic Message NACK (0x8003)\n[nack_code]
-            note right of CDA: Retry based on\nCP_DoIPNumberOfRetries\nand CP_DoIPRetryPeriod
+            note right of CDA: OUT_OF_MEMORY: retry per\nCP_DoIPNumberOfRetries\nand CP_DoIPRetryPeriod\nOther codes: report error
             deactivate GW
         end
 
@@ -960,4 +961,4 @@ DoIP Error Handling
          - Report timeout to caller
        * - Diagnostic NACK
          - DoIP entity rejected diagnostic message
-         - Retry per ``CP_DoIPNumberOfRetries`` with ``CP_DoIPRetryPeriod`` delay, based on NACK code
+         - OUT_OF_MEMORY: retry per ``CP_DoIPNumberOfRetries`` with ``CP_DoIPRetryPeriod`` delay; other codes: report error

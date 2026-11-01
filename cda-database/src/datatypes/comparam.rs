@@ -14,7 +14,6 @@
 use cda_interfaces::{
     DiagServiceError, HashMap,
     datatypes::{ComParamSimpleValue, ComParamValue, Unit},
-    util::try_strip_hex_prefix,
 };
 
 use crate::flatbuf::diagnostic_description::dataformat;
@@ -258,27 +257,6 @@ fn extract_dop_unit(dop: &dataformat::DOP) -> Option<Unit> {
     })
 }
 
-/// Map a DOIP NACK number of retries parameter from (String, u32) to (u8, u32).
-/// # Errors
-/// If the string cannot be parsed as a u8 (decimal or hex).
-pub fn map_nack_number_of_retries<K: AsRef<str>>(
-    (name, value): (K, &u32),
-) -> Result<(u8, u32), DiagServiceError> {
-    let name = name.as_ref();
-    let key_result = if let Some(hex_str) = try_strip_hex_prefix(name) {
-        u8::from_str_radix(hex_str, 16)
-    } else {
-        name.parse::<u8>()
-    }
-    .map_err(|_| {
-        DiagServiceError::ParameterConversionError(format!(
-            "Invalid string for doip.nack_number_of_retries: {name}"
-        ))
-    });
-
-    key_result.map(|key| (key, *value))
-}
-
 #[cfg(test)]
 mod tests {
     use cda_interfaces::{HashSet, HashSetExtensions};
@@ -520,53 +498,26 @@ mod tests {
         );
     }
 
+    /// `CP_DoIPNumberOfRetries` is a simple value in the database (one retry
+    /// count for `OUT_OF_MEMORY` NACKs) and must be used instead of the default.
     #[test]
-    fn test_map_nack_number_of_retries_from_complex_value() {
-        use cda_interfaces::datatypes::{ComplexComParamValue, DeserializableCompParam};
+    fn doip_number_of_retries_is_read_from_simple_database_value() {
+        let db = build_db(
+            &[ComParamRefSpec {
+                protocol: "DB_PROTO",
+                name: "CP_DoIPNumberOfRetries",
+                value: "5",
+            }],
+            true,
+        )
+        .expect("valid database");
+        let config = cda_interfaces::datatypes::DoipComParams::default().nack_number_of_retries;
 
-        let mut complex: ComplexComParamValue = HashMap::default();
-        complex.insert(
-            "0x21".to_owned(),
-            ComParamValue::Simple(ComParamSimpleValue {
-                value: "3".to_owned(),
-                unit: None,
-            }),
-        );
-        complex.insert(
-            "0x22".to_owned(),
-            ComParamValue::Simple(ComParamSimpleValue {
-                value: "5".to_owned(),
-                unit: None,
-            }),
-        );
+        let retries = db
+            .find_com_param(None, &config)
+            .expect("com param lookup failed");
 
-        let parsed = HashMap::<String, u32>::parse_from_complex(&complex).unwrap();
-        let result: HashMap<u8, u32> = parsed
-            .iter()
-            .map(map_nack_number_of_retries)
-            .collect::<Result<HashMap<u8, u32>, DiagServiceError>>()
-            .unwrap();
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.get(&0x21), Some(&3));
-        assert_eq!(result.get(&0x22), Some(&5));
-    }
-
-    #[test]
-    fn test_map_nack_number_of_retries_decimal_keys() {
-        let result = map_nack_number_of_retries(("33", &3)).unwrap();
-        assert_eq!(result, (33, 3));
-    }
-
-    #[test]
-    fn test_map_nack_number_of_retries_hex_keys() {
-        let result = map_nack_number_of_retries(("0x21", &3)).unwrap();
-        assert_eq!(result, (0x21, 3));
-    }
-
-    #[test]
-    fn test_map_nack_number_of_retries_invalid_key() {
-        let result = map_nack_number_of_retries(("not_valid", &3));
-        assert!(result.is_err());
+        assert_ne!(config.value, 5, "test value must differ from the default");
+        assert_eq!(retries, 5);
     }
 }

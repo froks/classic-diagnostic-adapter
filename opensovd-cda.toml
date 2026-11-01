@@ -204,19 +204,16 @@
 # Value used when the database does not provide one, or precedence is set to `Config`.
 # value = 0x00
 
-# Number of retries for specific NACKs
-# The key must be a string, because parsing from toml requires keys to be strings,
-# no other types are supported.
+# Number of retries after a diagnostic message NACK with code
+# `OUT_OF_MEMORY` (`0x05`). Other NACK codes are not retried.
 [com_params.doip.nack_number_of_retries]
 # Communication parameter identifier (`CP_xxx` name from the database).
 # name = "CP_DoIPNumberOfRetries"
 # Controls whether a com-parameter value is resolved from the MDD database
 # or forced from the configuration file.
 # precedence = "Database"
-
 # Value used when the database does not provide one, or precedence is set to `Config`.
-[com_params.doip.nack_number_of_retries.value]
-# 0x03 = 3
+# value = 3
 
 # Number of retries in case a transmission error,
 # a reception error, or transport layer timeout is encountered
@@ -229,7 +226,7 @@
 # Value used when the database does not provide one, or precedence is set to `Config`.
 # value = 3
 
-# Period between retries, after specific NACK conditions are encountered
+# Period between retries after a diagnostic message NACK with code `OUT_OF_MEMORY`
 [com_params.doip.retry_period]
 # Communication parameter identifier (`CP_xxx` name from the database).
 # name = "CP_DoIPRetryPeriod"
