@@ -719,6 +719,8 @@ impl<S: EcuGateway, T: UdsEcuDb + VariantDetection + EcuSecurity> UdsManager<S, 
                     timeout_ack: ecu.diagnostic_ack_timeout(),
                     ecu_name: ecu.ecu_name(),
                     repeat_request_count_transmission: ecu.repeat_request_count_transmission(),
+                    nack_number_of_retries: ecu.nack_number_of_retries(),
+                    retry_period: ecu.retry_period(),
                 },
             )
         };

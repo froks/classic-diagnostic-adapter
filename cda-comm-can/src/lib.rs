@@ -434,6 +434,8 @@ mod transport_routing_tests {
                 timeout_ack: std::time::Duration::from_millis(100),
                 ecu_name: "ecu1".to_owned(),
                 repeat_request_count_transmission: 0,
+                nack_number_of_retries: 0,
+                retry_period: std::time::Duration::ZERO,
             },
             ServicePayload {
                 data: vec![0x3E, 0x00],

@@ -671,6 +671,8 @@ mod tests {
             timeout_ack: Duration::from_millis(10),
             ecu_name: "gateway".to_owned(),
             repeat_request_count_transmission: 0,
+            nack_number_of_retries: 0,
+            retry_period: Duration::ZERO,
         }
     }
 

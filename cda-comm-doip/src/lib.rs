@@ -32,7 +32,7 @@ use cda_interfaces::{
 use doip_definitions::{
     header::ProtocolVersion,
     payload::{
-        DiagnosticMessage, DiagnosticMessageNack, DoipPayload, GenericNack,
+        DiagnosticMessage, DiagnosticMessageNack, DiagnosticNackCode, DoipPayload, GenericNack,
         RoutingActivationRequest,
     },
 };
@@ -1197,6 +1197,25 @@ impl<T: EcuAddresses + DoipComParams> TransportProbe for DoipDiagGateway<T> {
         std::future::ready(false)
     }
 }
+/// Why waiting for the ACK of a diagnostic message failed.
+#[derive(Debug)]
+enum AckError {
+    /// The `DoIP` entity rejected the message with a diagnostic message NACK
+    /// (`0x8003`) carrying this code. May be repeated per `CP_DoIPNumberOfRetries`.
+    DiagnosticNack(u8),
+    /// Any other failure, including a generic NACK (`0x0000`).
+    Failed(DiagServiceError),
+}
+
+impl From<AckError> for DiagServiceError {
+    fn from(error: AckError) -> Self {
+        match error {
+            AckError::DiagnosticNack(code) => DiagServiceError::Nack(code),
+            AckError::Failed(error) => error,
+        }
+    }
+}
+
 /// Waits for the `DoIP` diagnostic-message acknowledgement from the gateway,
 /// with a deadline of `timeout`.
 #[allow(
@@ -1208,12 +1227,12 @@ async fn wait_for_ack_or_response_until_timeout(
     ecu_name: &str,
     sent_message: &DiagnosticMessage,
     timeout: Duration,
-) -> Result<Option<DiagnosticResponse>, DiagServiceError> {
+) -> Result<Option<DiagnosticResponse>, AckError> {
     async fn wait_for_ack_or_response(
         receiver: &mut broadcast::Receiver<Result<DiagnosticResponse, EcuError>>,
         ecu_name: &str,
         sent_message: &DiagnosticMessage,
-    ) -> Result<Option<DiagnosticResponse>, DiagServiceError> {
+    ) -> Result<Option<DiagnosticResponse>, AckError> {
         loop {
             let response = match receiver.recv().await {
                 Ok(Ok(response)) => response,
@@ -1224,9 +1243,9 @@ async fn wait_for_ack_or_response_until_timeout(
                         "Error while waiting for ACK/NACK"
                     );
 
-                    return Err(DiagServiceError::NoResponse(format!(
+                    return Err(AckError::Failed(DiagServiceError::NoResponse(format!(
                         "Error while waiting for ACK/NACK, {e}"
-                    )));
+                    ))));
                 }
                 Err(_) => {
                     tracing::error!(
@@ -1234,9 +1253,9 @@ async fn wait_for_ack_or_response_until_timeout(
                         "ECU receiver unexpectedly closed while waiting for ACK/NACK"
                     );
 
-                    return Err(DiagServiceError::NoResponse(
+                    return Err(AckError::Failed(DiagServiceError::NoResponse(
                         "ECU receiver unexpectedly closed".to_owned(),
-                    ));
+                    )));
                 }
             };
 
@@ -1247,7 +1266,7 @@ async fn wait_for_ack_or_response_until_timeout(
                         nack_code = ?nack.nack_code,
                         "Received NACK"
                     );
-                    return Err(DiagServiceError::Nack(u8::from(nack.nack_code)));
+                    return Err(AckError::DiagnosticNack(u8::from(nack.nack_code)));
                 }
                 DiagnosticResponse::GenericNack(nack) => {
                     tracing::warn!(
@@ -1255,7 +1274,9 @@ async fn wait_for_ack_or_response_until_timeout(
                         nack_code = ?nack.nack_code,
                         "Received generic NACK"
                     );
-                    return Err(DiagServiceError::Nack(u8::from(nack.nack_code)));
+                    return Err(AckError::Failed(DiagServiceError::Nack(u8::from(
+                        nack.nack_code,
+                    ))));
                 }
                 _ => {}
             }
@@ -1308,7 +1329,7 @@ async fn wait_for_ack_or_response_until_timeout(
             timeout = ?timeout,
             "Timeout waiting for ACK/NACK from ECU"
         );
-        Err(DiagServiceError::Timeout)
+        Err(AckError::Failed(DiagServiceError::Timeout))
     }
 }
 
@@ -1685,20 +1706,46 @@ async fn transmit_with_retries(
     }
 }
 
-/// Sends `msg` and waits for its ACK.
+/// Sends `msg` and waits for its ACK. After a diagnostic message NACK with
+/// code `OUT_OF_MEMORY` the message is sent again after `CP_DoIPRetryPeriod`,
+/// up to `CP_DoIPNumberOfRetries` times; any other NACK is returned as
+/// `DiagServiceError::Nack`.
 async fn send_and_wait_for_ack(
     ecu: &mut DoipEcu,
     msg: &DiagnosticMessage,
     params: &TransmissionParameters,
 ) -> Result<Option<DiagnosticResponse>, DiagServiceError> {
-    transmit_with_retries(msg, &ecu.sender, params.repeat_request_count_transmission).await?;
-    wait_for_ack_or_response_until_timeout(
-        &mut ecu.receiver,
-        &params.ecu_name,
-        msg,
-        params.timeout_ack,
-    )
-    .await
+    const OUT_OF_MEMORY: u8 = DiagnosticNackCode::OutOfMemory as u8;
+
+    let mut nack_retries: u32 = 0;
+    loop {
+        transmit_with_retries(msg, &ecu.sender, params.repeat_request_count_transmission).await?;
+        match wait_for_ack_or_response_until_timeout(
+            &mut ecu.receiver,
+            &params.ecu_name,
+            msg,
+            params.timeout_ack,
+        )
+        .await
+        {
+            Err(AckError::DiagnosticNack(OUT_OF_MEMORY))
+                if nack_retries < params.nack_number_of_retries =>
+            {
+                nack_retries = nack_retries.saturating_add(1);
+                tracing::warn!(
+                    ecu_name = %params.ecu_name,
+                    retry = nack_retries,
+                    max_retries = params.nack_number_of_retries,
+                    retry_period = ?params.retry_period,
+                    "Received OUT_OF_MEMORY NACK, repeating request (CP_DoIPNumberOfRetries)"
+                );
+                tokio_ext::sleep_for(params.retry_period).await;
+                // Drop anything that arrived for the rejected attempt.
+                tokio_ext::clear_pending_messages(&mut ecu.receiver);
+            }
+            result => return result.map_err(DiagServiceError::from),
+        }
+    }
 }
 
 #[tracing::instrument(skip_all,
@@ -1728,13 +1775,13 @@ mod tests {
     };
     use doip_definitions::{
         header::ProtocolVersion,
-        payload::{DiagnosticMessage, DoipPayload},
+        payload::{DiagnosticMessage, DiagnosticMessageNack, DiagnosticNackCode, DoipPayload},
     };
     use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        ConnectionError, ConnectionTasks, DiagnosticResponse, DoIPUdpSocket, DoipConfig,
+        AckError, ConnectionError, ConnectionTasks, DiagnosticResponse, DoIPUdpSocket, DoipConfig,
         DoipConnection, DoipDiagGateway, DoipEcu, DoipGatewayState, config::DiscoveryMode,
         connection_sender::OutgoingMessage, read_ecu_responses, spawn_connection_task,
         test_helpers::TestEcu, transmit_with_retries, wait_for_ack_or_response_until_timeout,
@@ -2447,6 +2494,8 @@ mod tests {
             timeout_ack: Duration::from_secs(1),
             ecu_name: "test-ecu".to_owned(),
             repeat_request_count_transmission: 0,
+            nack_number_of_retries: 0,
+            retry_period: Duration::ZERO,
         }
     }
 
@@ -2683,6 +2732,22 @@ mod tests {
             .expect("send task panicked")
             .expect("send() returned an error");
     }
+    fn nack(code: DiagnosticNackCode) -> DiagnosticResponse {
+        DiagnosticResponse::Nack(DiagnosticMessageNack {
+            source_address: ECU_ADDR.to_be_bytes(),
+            target_address: TESTER_ADDR.to_be_bytes(),
+            nack_code: code,
+        })
+    }
+
+    fn params_with_nack_retries(retries: u32) -> TransmissionParameters {
+        TransmissionParameters {
+            nack_number_of_retries: retries,
+            retry_period: Duration::from_millis(10),
+            ..transmission_params()
+        }
+    }
+
     /// A failed write is repeated (`CP_RepeatReqCountTrans`); only the last
     /// allowed attempt asks for a connection reset, and it is not reached here.
     #[tokio::test]
@@ -2763,6 +2828,97 @@ mod tests {
             matches!(response, Ok(Some(TransportResponse::UdsResponse(_)))),
             "expected Message, got {response:?}"
         );
+    }
+
+    /// An `OUT_OF_MEMORY` diagnostic NACK repeats the request
+    /// (`CP_DoIPNumberOfRetries`).
+    #[tokio::test]
+    async fn send_repeats_request_after_configured_nack() {
+        let mut harness = TestHarness::start(params_with_nack_retries(2), Vec::new());
+        harness.next_written().await;
+        harness
+            .broadcast_tx
+            .send(Ok(nack(DiagnosticNackCode::OutOfMemory)))
+            .expect("Failed to send nack");
+
+        harness.next_written().await;
+        harness
+            .broadcast_tx
+            .send(Ok(ecu_msg_response()))
+            .expect("Failed to send response");
+
+        let response = harness.recv_response().await;
+        assert!(
+            matches!(response, Ok(Some(TransportResponse::UdsResponse(_)))),
+            "expected Message, got {response:?}"
+        );
+        assert!(drain_written(&mut harness.written_rx).is_empty());
+    }
+
+    /// The `OUT_OF_MEMORY` retries are limited; the last NACK is returned.
+    #[tokio::test]
+    async fn send_returns_nack_when_nack_retries_exhausted() {
+        let mut harness = TestHarness::start(params_with_nack_retries(1), Vec::new());
+        for _ in 0..2 {
+            harness.next_written().await;
+            harness
+                .broadcast_tx
+                .send(Ok(nack(DiagnosticNackCode::OutOfMemory)))
+                .expect("Failed to send nack");
+        }
+
+        let response = harness.recv_response().await;
+        assert!(
+            matches!(response, Err(DiagServiceError::Nack(code)) if code == u8::from(DiagnosticNackCode::OutOfMemory)),
+            "expected Nack, got {response:?}"
+        );
+        assert!(drain_written(&mut harness.written_rx).is_empty());
+    }
+
+    /// Other diagnostic NACK codes are not retried, even with retries configured.
+    #[tokio::test]
+    async fn send_does_not_repeat_other_nack_codes() {
+        let mut harness = TestHarness::start(params_with_nack_retries(3), Vec::new());
+        harness.next_written().await;
+        harness
+            .broadcast_tx
+            .send(Ok(nack(DiagnosticNackCode::TargetUnreachable)))
+            .expect("Failed to send nack");
+
+        let response = harness.recv_response().await;
+        assert!(
+            matches!(response, Err(DiagServiceError::Nack(code)) if code == u8::from(DiagnosticNackCode::TargetUnreachable)),
+            "expected Nack, got {response:?}"
+        );
+        assert!(drain_written(&mut harness.written_rx).is_empty());
+    }
+
+    /// `CP_DoIPNumberOfRetries` applies to diagnostic message NACKs only: a
+    /// generic NACK `OUT_OF_MEMORY` is not repeated.
+    #[tokio::test]
+    async fn send_does_not_repeat_generic_nack() {
+        use doip_definitions::payload::{GenericNack, NackCode};
+
+        let params = TransmissionParameters {
+            nack_number_of_retries: 3,
+            retry_period: Duration::from_millis(10),
+            ..transmission_params()
+        };
+        let mut harness = TestHarness::start(params, Vec::new());
+        harness.next_written().await;
+        harness
+            .broadcast_tx
+            .send(Ok(DiagnosticResponse::GenericNack(GenericNack {
+                nack_code: NackCode::OutOfMemory,
+            })))
+            .expect("Failed to send generic nack");
+
+        let response = harness.recv_response().await;
+        assert!(
+            matches!(response, Err(DiagServiceError::Nack(_))),
+            "expected Nack, got {response:?}"
+        );
+        assert!(drain_written(&mut harness.written_rx).is_empty());
     }
 
     #[tokio::test]
@@ -2864,7 +3020,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(DiagServiceError::Nack(_))),
+            matches!(result, Err(AckError::DiagnosticNack(_))),
             "expected Nack, got {result:?}"
         );
     }
@@ -2891,7 +3047,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(DiagServiceError::Nack(_))),
+            matches!(result, Err(AckError::Failed(DiagServiceError::Nack(_)))),
             "expected Nack, got {result:?}"
         );
     }
@@ -2911,7 +3067,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(DiagServiceError::Timeout)),
+            matches!(result, Err(AckError::Failed(DiagServiceError::Timeout))),
             "expected Timeout, got {result:?}"
         );
     }
@@ -2933,7 +3089,10 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(DiagServiceError::NoResponse(_))),
+            matches!(
+                result,
+                Err(AckError::Failed(DiagServiceError::NoResponse(_)))
+            ),
             "expected NoResponse, got {result:?}"
         );
     }

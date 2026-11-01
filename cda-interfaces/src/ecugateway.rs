@@ -28,6 +28,13 @@ pub struct TransmissionParameters {
     /// Number of repetitions of a request whose transmission failed
     /// (`CP_RepeatReqCountTrans`).
     pub repeat_request_count_transmission: u32,
+    /// Number of repetitions after a diagnostic message NACK with code
+    /// `OUT_OF_MEMORY` (`CP_DoIPNumberOfRetries`). Other NACK codes are not
+    /// repeated.
+    pub nack_number_of_retries: u32,
+    /// Delay before repeating a request after an `OUT_OF_MEMORY` NACK
+    /// (`CP_DoIPRetryPeriod`).
+    pub retry_period: Duration,
 }
 
 /// Physical transmission of UDS messages on a single transport.
